@@ -1,0 +1,362 @@
+/*
+References
+    https://www.hl7.org/fhir/patient-examples.html
+    https://www.hl7.org/fhir/patient-example-c.html
+    https://docs.snowflake.com/en/sql-reference/functions-semistructured.html
+
+Use Case
+    You are a payer organization working with hospitals. 
+    Hospital sends you an HL7 message to notify you of patient death, however, the message version does not contain the date of death.
+    You also received supporting documentation in PDF format, which does contain a death date. 
+    You need to automate the process of parsing semistructured and unstructured data.
+    You also need to forward the info in a JSON format to another organization.
+
+What we will see:
+    Using Snowflake for Data Engineering.  
+    Create two Fast Healthcare Interoperability Resources (FHIR) record for deceased patient in Variant DataType
+    Create two structured data records from Snowflake Shared Data
+    Parse supporting documentation in PDF format to obtain a key data element
+    Use Semi-Structured functions like object_construct and array_agg to manipulate the FHIR / JSON data
+    Verify records exported as JSON
+
+Benefits
+    Snowflake for your Data Lake and Data Engineering workloads
+    Process all data types, including unstructured
+    High-performance, governed ETL / ELT with only SQL and no separate tools or data silos
+    Lower TCO with fewer tools, fewer data silos, and less operational risk
+
+*/
+
+// Setup
+--context
+use role sysadmin;  
+  use warehouse adhoc;  
+  use database fhir;
+  use schema public;
+
+--external stage for raw and exported data
+create stage FHIR_Death_Record_Demo
+ url = 's3://drostovtseva/FHIR_Death_Record_Demo/'
+ storage_integration=s3_unstructured
+ directory = (enable = true auto_refresh = true);
+
+alter stage FHIR_Death_Record_Demo refresh;
+
+--external stage with some jars and open source models
+create stage jars_stage_external
+ url = 's3://drostovtseva/jars-and-models/'
+ storage_integration=s3_unstructured
+ directory = (enable = true auto_refresh = true);
+
+--API integration with AWS proxy service. An API integration object stores information about an HTTPS proxy service
+CREATE API INTEGRATION COMPREHEND
+  API_PROVIDER = AWS_API_GATEWAY
+  API_AWS_ROLE_ARN = 'arn:aws:iam::484577546576:role/drostovtseva_sf_detect_pii'
+  ENABLED = TRUE
+  API_ALLOWED_PREFIXES = ('https://rbsmq5ez3l.execute-api.us-east-1.amazonaws.com/sf-stage/');
+
+CREATE EXTERNAL FUNCTION GET_PII_ENTITIES(CHECK_STRING VARCHAR)
+   RETURNS VARIANT
+   API_INTEGRATION = COMPREHEND
+   AS 'https://rbsmq5ez3l.execute-api.us-east-1.amazonaws.com/sf-stage/sf-extract-pii';
+
+
+//create FHIR / JSON patient record for Sherry Small
+create or replace transient table patient (deceased variant)
+as select parse_json(column1) as src
+from values
+($$
+{
+  "resourceType": "Patient",
+  "id": "63081838",
+  "text": {
+    "status": "generated",
+    "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">\n\t\t\t<p>Patient Sherry Small @ Acme Healthcare, Inc. MR = 123458, DECEASED</p>\n\t\t</div>"
+  },
+  "identifier": [
+    {
+      "use": "usual",
+      "type": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+            "code": "MR"
+          }
+        ]
+      },
+      "system": "urn:oid:0.1.2.3.4.5.6.7",
+      "value": "123458"
+    }
+  ],
+  "active": true,
+  "name": [
+    {
+      "use": "official",
+      "family": "Small",
+      "given": [
+        "Sherry"
+      ]
+    }
+  ],
+  "gender": "female",
+  "birthDate": "1928-12-28",
+  "deceasedBoolean": true,
+  "managingOrganization": {
+    "reference": "Organization/1",
+    "display": "ACME Healthcare, Inc"
+  }
+}
+ 
+$$);
+
+--add patient record for Bobby Harmon
+insert into patient
+select parse_json(
+$$
+{
+  "resourceType": "Patient",
+  "id": "51991432",
+  "text": {
+    "status": "generated",
+    "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">\n\t\t\t<p>Patient Bobby Harmon @ Acme Healthcare, Inc. MR = 123458, DECEASED</p>\n\t\t</div>"
+  },
+  "identifier": [
+    {
+      "use": "usual",
+      "type": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+            "code": "MR"
+          }
+        ]
+      },
+      "system": "urn:oid:0.1.2.3.4.5.6.7",
+      "value": "123458"
+    }
+  ],
+  "active": true,
+  "name": [
+    {
+      "use": "official",
+      "family": "Harmon",
+      "given": [
+        "Bobby"
+      ]
+    }
+  ],
+  "gender": "male",
+  "birthDate": "1982-08-02",
+  "deceasedBoolean": true,
+  "managingOrganization": {
+    "reference": "Organization/1",
+    "display": "ACME Healthcare, Inc"
+  }
+} 
+$$);
+
+//Variant stores raw JSON / FHIR
+select * 
+from patient;
+
+//Parse the VARIANT using dot notation
+select
+deceased:id::string MRN,
+deceased:name[0].family::string last_name,
+deceased:name[0].given[0]::string first_name,
+deceased:gender::string gender,
+deceased:birthDate::date birthdate
+from patient;
+
+//View unstructured data
+ls @FHIR_Death_Record_Demo/PDF;
+
+select *
+from directory(@FHIR_Death_Record_Demo)
+where startswith(relative_path,'PDF');
+
+--generate presigned URL which is a temporary link that is active for the live of the token
+select get_presigned_url(@FHIR_Death_Record_Demo, 'PDF/51991432.pdf');
+
+//Get text from the PDF
+-- Create a java function to parse PDF files
+-- This UDF is created inline but uses an external jar file for Apache PDFBox, an open source library for working with PDF documents
+
+create or replace function read_pdf(file string)
+returns string
+language java
+imports = ('@jars_stage_external/pdfbox-app-2.0.24.jar')
+HANDLER = 'PdfParser.ReadFile'
+as
+$$
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.pdfbox.text.PDFTextStripperByArea;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+public class PdfParser {
+
+    public static String ReadFile(InputStream stream) throws IOException {
+        try (PDDocument document = PDDocument.load(stream)) {
+
+            document.getClass();
+
+            if (!document.isEncrypted()) {
+
+                PDFTextStripperByArea stripper = new PDFTextStripperByArea();
+                stripper.setSortByPosition(true);
+
+                PDFTextStripper tStripper = new PDFTextStripper();
+
+                String pdfFileInText = tStripper.getText(document);
+                return pdfFileInText;
+            }
+        }
+
+        return null;
+    }
+}
+$$;
+
+//Test extracting text 
+--we are using a Java UDF to grab text from the PDF. Java UDF executes directly in Snowflake
+select read_pdf('@FHIR_Death_Record_Demo/' || relative_path) doctext
+from directory(@FHIR_Death_Record_Demo)
+where startswith(relative_path,'PDF');
+
+//Test extracting PII from text - Date of Death
+--this external function calls
+describe function GET_PII_ENTITIES(string);
+
+--look at raw output of Comprehend PII Detection Model
+select 
+    get_pii_entities(read_pdf('@FHIR_Death_Record_Demo/' || relative_path)) pii
+    from directory(@FHIR_Death_Record_Demo)
+    where startswith(relative_path,'PDF');
+
+--Tease out the Death Date by using the offsets for date-time entities found and looking for the entity in the visinity of the term "expiration"
+with json as
+    (select 
+    substr(split_part(relative_path,'/',2),1,8) id, 
+    read_pdf('@FHIR_Death_Record_Demo/' || relative_path) doctext,
+    get_pii_entities(doctext) pii
+    from directory(@FHIR_Death_Record_Demo)
+    where startswith(relative_path,'PDF'))
+select 
+id,
+doctext,
+f.value:BeginOffset::float BeginOffset,
+f.value:EndOffset::float EndOffset,
+f.value:Type::string Type,
+substr(doctext,BeginOffset, EndOffset-BeginOffset+1)::date DeathDate
+from json, table(flatten(pii:Entities)) f
+where Type='DATE_TIME' and position('EXPIRATION',doctext,1)<BeginOffset
+;
+                                    
+//Combine JSON and PDF data
+--create table that contains all the key elements from the original HL7 message plus the date of death extracted from PDFs
+create or replace table patient_pdf as
+with pat as
+    (select
+     deceased:id::string id
+    ,deceased:name[0].family::string last_name
+    ,deceased:name[0].given[0]::string first_name
+    ,deceased:gender::string gender
+    ,deceased:birthDate::date birthdate
+    from patient),
+    pdf_data as 
+        (
+            with json as
+            (select 
+            substr(split_part(relative_path,'/',2),1,8) id, 
+            read_pdf('@FHIR_Death_Record_Demo/' || relative_path) doctext,
+            get_pii_entities(doctext) pii
+            from directory(@FHIR_Death_Record_Demo)
+            where startswith(relative_path,'PDF'))
+        select 
+        id,
+        doctext,
+        f.value:BeginOffset::float BeginOffset,
+        f.value:EndOffset::float EndOffset,
+        f.value:Type::string Type,
+        substr(doctext,BeginOffset, EndOffset-BeginOffset+1)::date DeathDate
+        from json, table(flatten(pii:Entities)) f
+        where Type='DATE_TIME' and position('EXPIRATION',doctext,1)<BeginOffset) 
+select pat.*, pdf_data.DeathDate
+from pat left join pdf_data
+on pat.id=pdf_data.id;
+
+select * from patient_pdf;
+
+//Create a JSON record for exporting
+--use object_construct to generate a new JSON
+select 
+object_construct('Identifiers', object_construct
+                                 ('ID', ID, 
+                                  'FNAME', First_Name,
+                                  'LNAME', Last_Name),
+                 'Dates', object_construct
+                                 ('DOB',Birthdate,
+                                  'DOD', DeathDate)) Json_export
+from patient_pdf;
+
+//Export to a stage
+
+create or replace transient table patient_export (v variant);
+
+insert into patient_export
+select 
+object_construct('Identifiers', object_construct
+                                 ('ID', ID, 
+                                  'FNAME', First_Name,
+                                  'LNAME', Last_Name),
+                 'Dates', object_construct
+                                 ('DOB',Birthdate,
+                                  'DOD', DeathDate)) Json_export
+from patient_pdf;
+
+select * from patient_export;
+
+-----------------------------------------------------
+--export as JSON file to data lake
+ 
+-- Create an external stage where documents are stored.
+--see what is in our cloud storage
+ls @FHIR_Death_Record_Demo/JSON_export;
+    
+    --optional: remove file(s)
+rm @FHIR_Death_Record_Demo/JSON_export;
+    
+--export to cloud storage
+copy into @FHIR_Death_Record_Demo/JSON_export from 
+    (select * from patient_export)
+    file_format=(type=json)
+    overwrite = true; 
+
+--verify files here or in cloud storage
+ls @FHIR_Death_Record_Demo/JSON_export;
+    
+/*
+What we saw:
+    Using Snowflake for Data Engineering.  
+    Create two Fast Healthcare Interoperability Resources (FHIR) record for deceased patient in Variant DataType
+    Create two structured data records from Snowflake Shared Data
+    Parse supporting documentation in PDF format to obtain a key data element
+    Use Semi-Structured functions like object_construct and array_agg to manipulate the FHIR / JSON data
+    Verify records exported as JSON
+
+Benefits
+    Snowflake for your Data Lake and Data Engineering workloads
+    Process all data types, including unstructured
+    High-performance, governed ETL / ELT with only SQL and no separate tools or data silos
+    Lower TCO with fewer tools, fewer data silos, and less operational risk
+*/
+
+
+
+--reset
+rm @FHIR_Death_Record_Demo/JSON_export;
