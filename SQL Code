@@ -35,7 +35,7 @@ use role sysadmin;
   use schema public;
 
 --external stage for raw and exported data
-create stage FHIR_Death_Record_Demo
+create stage if not exists FHIR_Death_Record_Demo
  url = 's3://drostovtseva/FHIR_Death_Record_Demo/'
  storage_integration=s3_unstructured
  directory = (enable = true auto_refresh = true);
@@ -43,22 +43,32 @@ create stage FHIR_Death_Record_Demo
 alter stage FHIR_Death_Record_Demo refresh;
 
 --external stage with some jars and open source models
-create stage jars_stage_external
+create stage if not exists jars_stage_external
  url = 's3://drostovtseva/jars-and-models/'
  storage_integration=s3_unstructured
  directory = (enable = true auto_refresh = true);
 
 --API integration with AWS proxy service. An API integration object stores information about an HTTPS proxy service
-CREATE API INTEGRATION COMPREHEND
+CREATE API INTEGRATION IF NOT EXISTS COMPREHEND
   API_PROVIDER = AWS_API_GATEWAY
   API_AWS_ROLE_ARN = 'arn:aws:iam::484577546576:role/drostovtseva_sf_detect_pii'
   ENABLED = TRUE
   API_ALLOWED_PREFIXES = ('https://rbsmq5ez3l.execute-api.us-east-1.amazonaws.com/sf-stage/');
 
-CREATE EXTERNAL FUNCTION GET_PII_ENTITIES(CHECK_STRING VARCHAR)
+CREATE EXTERNAL FUNCTION IF NOT EXISTS GET_PII_ENTITIES(CHECK_STRING VARCHAR)
    RETURNS VARIANT
    API_INTEGRATION = COMPREHEND
    AS 'https://rbsmq5ez3l.execute-api.us-east-1.amazonaws.com/sf-stage/sf-extract-pii';
+
+//create sample patient diagnosis data
+create or replace table patient_diagnoses (MRN string, diagnosis string);
+
+insert into patient_diagnoses
+values
+('51991432','I46'),
+('51991432','G93.1'),
+('63081838','E23.2'),
+('63081838','P71.4');
 
 
 //create FHIR / JSON patient record for Sherry Small
@@ -294,30 +304,43 @@ select * from patient_pdf;
 
 //Create a JSON record for exporting
 --use object_construct to generate a new JSON
+
+with diag as
+    (select MRN, array_agg(diagnosis) within group (order by MRN asc) diagnoses_array
+     from patient_diagnoses
+     group by MRN)
 select 
 object_construct('Identifiers', object_construct
-                                 ('ID', ID, 
-                                  'FNAME', First_Name,
-                                  'LNAME', Last_Name),
+                                 ('MRN', a.ID, 
+                                  'FNAME', a.First_Name,
+                                  'LNAME', a.Last_Name),
                  'Dates', object_construct
-                                 ('DOB',Birthdate,
-                                  'DOD', DeathDate)) Json_export
-from patient_pdf;
+                                 ('DOB', a.Birthdate,
+                                  'DOD', a.DeathDate),
+                 'Diagnoses',b.diagnoses_array) Json_export
+from patient_pdf as a left join diag b 
+on a.ID=b.MRN
+;
 
 //Export to a stage
-
 create or replace transient table patient_export (v variant);
 
 insert into patient_export
+with diag as
+    (select MRN, array_agg(diagnosis) within group (order by MRN asc) diagnoses_array
+     from patient_diagnoses
+     group by MRN)
 select 
 object_construct('Identifiers', object_construct
-                                 ('ID', ID, 
-                                  'FNAME', First_Name,
-                                  'LNAME', Last_Name),
+                                 ('MRN', a.ID, 
+                                  'FNAME', a.First_Name,
+                                  'LNAME', a.Last_Name),
                  'Dates', object_construct
-                                 ('DOB',Birthdate,
-                                  'DOD', DeathDate)) Json_export
-from patient_pdf;
+                                 ('DOB', a.Birthdate,
+                                  'DOD', a.DeathDate),
+                 'Diagnoses',b.diagnoses_array) Json_export
+from patient_pdf as a left join diag b 
+on a.ID=b.MRN;
 
 select * from patient_export;
 
@@ -329,7 +352,7 @@ select * from patient_export;
 ls @FHIR_Death_Record_Demo/JSON_export;
     
     --optional: remove file(s)
-rm @FHIR_Death_Record_Demo/JSON_export;
+--rm @FHIR_Death_Record_Demo/JSON_export;
     
 --export to cloud storage
 copy into @FHIR_Death_Record_Demo/JSON_export from 
@@ -360,3 +383,5 @@ Benefits
 
 --reset
 rm @FHIR_Death_Record_Demo/JSON_export;
+
+
